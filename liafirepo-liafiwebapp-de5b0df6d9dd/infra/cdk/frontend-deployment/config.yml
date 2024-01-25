@@ -1,0 +1,6 @@
+deploymentBucketName: liafi-frontend-webapp-dev
+connectionArn: arn:aws:codestar-connections:us-west-2:585824962876:connection/cc5d1607-f6e5-4982-8f14-6a63e3a2f26d
+codeSource:
+  owner: liafirepo
+  repo: liafiwebapp
+  branch: develop

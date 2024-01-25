@@ -1,0 +1,409 @@
+image: node:20.9.0
+
+definitions:
+  steps:
+    - variables:
+        - name: env
+          default: dev
+          allowed-values:
+            - "dev"
+            - "staging"
+            - "prod"
+        - name: account
+          default: "585824962876"
+          allowed-values:
+            - "585824962876"
+            - "450951497613"
+            - "329620304507"
+    - step: &cf_caches_invalidation
+        name: Cloudfront cache invalidation
+        image: amazon/aws-cli
+        oidc: true
+        script:
+          - export AWS_REGION=$AWS_DEFAULT_REGION
+          - export AWS_ROLE_ARN="arn:aws:iam::$account:role/$env-bitbucket-pipelines-devops"
+          - export AWS_WEB_IDENTITY_TOKEN_FILE=$(pwd)/web-identity-token
+          - echo $BITBUCKET_STEP_OIDC_TOKEN > $(pwd)/web-identity-token
+          - origin="liafi-frontend-webapp-$env-origin"
+          - DISTRIBUTION_ID=$(aws cloudfront list-distributions --no-paginate --output text --query 'DistributionList.Items[?Origins.Quantity > `0`] | [?contains(Origins.Items[].Id, `'"${origin}"'`)].Id')
+          - INVALIDATION_ID=$(aws cloudfront create-invalidation --distribution-id "${DISTRIBUTION_ID}" --paths '/*' --no-paginate --output text --query 'Invalidation.Id')
+          - echo $DISTRIBUTION_ID && echo $INVALIDATION_ID
+          - aws cloudfront wait invalidation-completed --distribution-id "${DISTRIBUTION_ID}" --id "${INVALIDATION_ID}" 
+          - echo "New cache invalidation has been created and completed successfully !!"
+                
+pipelines:
+  default:
+    - step:
+        name: Pipeline
+        script:
+          - echo "This Pipelines runs on branches develop, staging, and production\n"
+          - echo "It will build (CI) in any branch in dev environment\n"
+          - echo "It will deploy only to Liafi env accounts from the main Branchs (CD/develop/staging/production)"
+    - step:
+        name: Security Scan
+        script:
+          # Run a security scan for sensitive data.
+          - pipe: atlassian/git-secrets-scan:0.5.1
+  custom:
+    Build-with-Parameters:
+      - variables:
+          - name: env
+            default: dev
+            allowed-values:
+              - "dev"
+              - "staging"
+              - "prod"
+          - name: account
+            default: "585824962876"
+            allowed-values:
+              - "585824962876"
+              - "450951497613"
+              - "329620304507"
+      - step:
+          name: CDK Stack in custom Env
+          oidc: true
+          caches:
+              - node
+          script:
+            - export AWS_REGION=$AWS_DEFAULT_REGION
+            - export AWS_ROLE_ARN="arn:aws:iam::$account:role/$env-bitbucket-pipelines-devops"
+            - export AWS_WEB_IDENTITY_TOKEN_FILE=$(pwd)/web-identity-token
+            - echo $BITBUCKET_STEP_OIDC_TOKEN > $(pwd)/web-identity-token
+            - cd infra/cdk/frontend-deployment
+            - ./scripts/install_tools.sh
+            - python3 -m venv .venv
+            - source .venv/bin/activate
+            - ./scripts/install_deps.sh
+            - npx cdk ls && npx cdk synth && npx cdk bootstrap aws://$account/$AWS_DEFAULT_REGION
+            - npx cdk diff
+            
+          artifacts:
+            - infra/cdk/frontend-deployment/cdk.out/**
+      - step:
+          name: Cloudfront stack plane to custom Env
+          image: hashicorp/terraform 
+          oidc: true
+          script:
+            - export AWS_REGION=$AWS_DEFAULT_REGION
+            - export AWS_ROLE_ARN="arn:aws:iam::$account:role/$env-bitbucket-pipelines-devops"
+            - export AWS_WEB_IDENTITY_TOKEN_FILE=$(pwd)/web-identity-token
+            - echo $BITBUCKET_STEP_OIDC_TOKEN > $(pwd)/web-identity-token
+            - cd infra/terraform && terraform fmt  
+            - terraform init -input=false -backend-config="bucket=liafi-$env-tfstatefiles-bucket" && terraform validate
+            - terraform plan -var-file=vars/$env.tfvars -out=tfplan
+          artifacts:
+            - infra/terraform/tfplan
+      - step:
+          name: Custom Build -- Front-end
+          script:
+            - cd frontend
+            - npm ci
+            - npm run build
+          artifacts:
+            - frontend/build/**
+      - step:
+          name: CDK Deploy to custom Env
+          oidc: true
+          deployment: custom
+          trigger: manual
+          script:
+            - export AWS_REGION=$AWS_DEFAULT_REGION
+            - export AWS_ROLE_ARN="arn:aws:iam::$account:role/$env-bitbucket-pipelines-devops"
+            - export AWS_WEB_IDENTITY_TOKEN_FILE=$(pwd)/web-identity-token
+            - echo $BITBUCKET_STEP_OIDC_TOKEN > $(pwd)/web-identity-token
+            - cd infra/cdk/frontend-deployment
+            - npx cdk deploy --app 'cdk.out/' --require-approval never
+          # condition:
+          #   changesets:
+          #     includePaths:
+          #       - "infra/cdk/frontend-deployment/**"
+      - step:
+          name: Cloudfront stack Deploy to custom Env
+          image: hashicorp/terraform
+          oidc: true
+          deployment: custom-tf
+          trigger: manual
+          script:
+            - export AWS_REGION=$AWS_DEFAULT_REGION
+            - export AWS_ROLE_ARN="arn:aws:iam::$account:role/$env-bitbucket-pipelines-devops"
+            - export AWS_WEB_IDENTITY_TOKEN_FILE=$(pwd)/web-identity-token
+            - echo $BITBUCKET_STEP_OIDC_TOKEN > $(pwd)/web-identity-token
+            - cd infra/terraform
+            - terraform init -input=false -backend-config="bucket=liafi-$env-tfstatefiles-bucket"
+            - terraform apply -auto-approve tfplan
+      - step:
+          name: Custom AWS - upload artifacts
+          image: amazon/aws-cli
+          oidc: true
+          deployment: Artifact-upload
+          trigger: manual
+          script:
+            - export AWS_REGION=$AWS_DEFAULT_REGION
+            - export AWS_ROLE_ARN="arn:aws:iam::$account:role/$env-bitbucket-pipelines-devops"
+            - export AWS_WEB_IDENTITY_TOKEN_FILE=$(pwd)/web-identity-token
+            - echo $BITBUCKET_STEP_OIDC_TOKEN > $(pwd)/web-identity-token
+            - aws sts get-caller-identity
+            - aws s3 cp frontend/build s3://liafi-frontend-webapp-$env/ --recursive
+      - step: *cf_caches_invalidation  
+  branches:
+    develop:
+        - step:
+            name: CDK - FrontEnd Stack
+            oidc: true
+            caches:
+              - node
+            script:
+              - export AWS_REGION=$AWS_DEFAULT_REGION
+              - export AWS_ROLE_ARN=$AWS_DEV_ROLE_ARN
+              - export AWS_WEB_IDENTITY_TOKEN_FILE=$(pwd)/web-identity-token
+              - echo $BITBUCKET_STEP_OIDC_TOKEN > $(pwd)/web-identity-token
+              - cd infra/cdk/frontend-deployment
+              - ./scripts/install_tools.sh
+              - python3 -m venv .venv
+              - source .venv/bin/activate
+              - ./scripts/install_deps.sh
+              - npx cdk ls && npx cdk synth && npx cdk bootstrap aws://$LIAFI_DEV_ACCOUNT/$AWS_DEFAULT_REGION
+              - npx cdk diff
+            artifacts:
+              - infra/cdk/frontend-deployment/cdk.out/**
+            # condition:
+            #   changesets:
+            #     includePaths:
+            #       - "infra/cdk/frontend-deployment/**"
+        - step:
+            name: CDK - FE DEV Deploy
+            oidc: true
+            deployment: Develop
+            #trigger: manual
+            script:
+              - export AWS_REGION=$AWS_DEFAULT_REGION
+              - export AWS_ROLE_ARN=$AWS_DEV_ROLE_ARN
+              - export AWS_WEB_IDENTITY_TOKEN_FILE=$(pwd)/web-identity-token
+              - echo $BITBUCKET_STEP_OIDC_TOKEN > $(pwd)/web-identity-token
+              - cd infra/cdk/frontend-deployment
+              - npx cdk deploy --app 'cdk.out/' --require-approval never
+        - step:
+            name: Cloudfront stack plane
+            image: hashicorp/terraform 
+            oidc: true
+            script:
+              - export AWS_REGION=$AWS_DEFAULT_REGION
+              - export AWS_ROLE_ARN=$AWS_DEV_ROLE_ARN
+              - export AWS_WEB_IDENTITY_TOKEN_FILE=$(pwd)/web-identity-token
+              - echo $BITBUCKET_STEP_OIDC_TOKEN > $(pwd)/web-identity-token
+              - cd infra/terraform && terraform fmt  
+              - terraform init -input=false -backend-config="bucket=liafi-dev-tfstatefiles-bucket" && terraform validate
+              - terraform plan -var-file=vars/dev.tfvars -out=dev-tfplan
+            artifacts:
+              - infra/terraform/dev-tfplan
+        - step:
+            name: Cloudfront stack Deploy to dev
+            image: hashicorp/terraform
+            oidc: true
+            deployment: Develop-TF
+            #trigger: manual
+            script:
+              - export AWS_REGION=$AWS_DEFAULT_REGION
+              - export AWS_ROLE_ARN=$AWS_DEV_ROLE_ARN
+              - export AWS_WEB_IDENTITY_TOKEN_FILE=$(pwd)/web-identity-token
+              - echo $BITBUCKET_STEP_OIDC_TOKEN > $(pwd)/web-identity-token
+              - cd infra/terraform
+              - terraform init -input=false -backend-config="bucket=liafi-dev-tfstatefiles-bucket"
+              - terraform apply -auto-approve dev-tfplan
+        - step:
+            name: Build - Front-end
+            script:
+              - cd frontend
+              - npm ci
+              - npm run build
+            artifacts:
+              - frontend/build/**
+    staging:
+        - step:
+            name: CDK - FrontEnd Stack
+            oidc: true
+            caches:
+              - node
+            script:
+              - export AWS_REGION=$AWS_DEFAULT_REGION
+              - export AWS_ROLE_ARN=$AWS_STAGING_ROLE_ARN
+              - export AWS_WEB_IDENTITY_TOKEN_FILE=$(pwd)/web-identity-token
+              - echo $BITBUCKET_STEP_OIDC_TOKEN > $(pwd)/web-identity-token
+              - cd infra/cdk/frontend-deployment
+              - ./scripts/install_tools.sh
+              - python3 -m venv .venv
+              - source .venv/bin/activate
+              - ./scripts/install_deps.sh
+              - npx cdk ls && npx cdk synth && npx cdk bootstrap aws://$LIAFI_STAGING_ACCOUNT/$AWS_DEFAULT_REGION
+              - npx cdk diff
+            artifacts:
+              - infra/cdk/frontend-deployment/cdk.out/**
+            # condition:
+            #   changesets:
+            #     includePaths:
+            #       - "infra/cdk/frontend-deployment/**"
+        - step:
+            name: Cloudfront stack plane
+            image: hashicorp/terraform 
+            oidc: true
+            script:
+              - export AWS_REGION=$AWS_DEFAULT_REGION
+              - export AWS_ROLE_ARN=$AWS_STAGING_ROLE_ARN
+              - export AWS_WEB_IDENTITY_TOKEN_FILE=$(pwd)/web-identity-token
+              - echo $BITBUCKET_STEP_OIDC_TOKEN > $(pwd)/web-identity-token
+              - cd infra/terraform && terraform fmt  
+              - terraform init -input=false -backend-config="bucket=liafi-staging-tfstatefiles-bucket" && terraform validate
+              - terraform plan -var-file=vars/staging.tfvars -out=staging-tfplan
+            artifacts:
+              - infra/terraform/staging-tfplan
+        - step:
+            name: Build - Front-end
+            script:
+              - cd frontend
+              - npm ci
+              - npm run build
+            artifacts:
+              - frontend/build/**      
+        - step:
+            name: CDK - FE STAGING Deploy
+            oidc: true
+            deployment: Staging
+            trigger: manual
+            script:
+              - export AWS_REGION=$AWS_DEFAULT_REGION
+              - export AWS_ROLE_ARN=$AWS_STAGING_ROLE_ARN
+              - export AWS_WEB_IDENTITY_TOKEN_FILE=$(pwd)/web-identity-token
+              - echo $BITBUCKET_STEP_OIDC_TOKEN > $(pwd)/web-identity-token
+              - cd infra/cdk/frontend-deployment
+              - npx cdk deploy --app 'cdk.out/' --require-approval never
+        - step:
+            name: Cloudfront stack Deploy to Staging
+            image: hashicorp/terraform
+            oidc: true
+            deployment: Staging-TF
+            trigger: manual
+            script:
+              - export AWS_REGION=$AWS_DEFAULT_REGION
+              - export AWS_ROLE_ARN=$AWS_STAGING_ROLE_ARN
+              - export AWS_WEB_IDENTITY_TOKEN_FILE=$(pwd)/web-identity-token
+              - echo $BITBUCKET_STEP_OIDC_TOKEN > $(pwd)/web-identity-token
+              - cd infra/terraform
+              - terraform init -input=false -backend-config="bucket=liafi-staging-tfstatefiles-bucket"
+              - terraform apply -auto-approve staging-tfplan
+    production:
+        - step:
+            name: CDK - FrontEnd Stack
+            oidc: true
+            script:
+              - export AWS_REGION=$AWS_DEFAULT_REGION
+              - export AWS_ROLE_ARN=$AWS_PROD_ROLE_ARN
+              - export AWS_WEB_IDENTITY_TOKEN_FILE=$(pwd)/web-identity-token
+              - echo $BITBUCKET_STEP_OIDC_TOKEN > $(pwd)/web-identity-token
+              - cd infra/cdk/frontend-deployment
+              - ./scripts/install_tools.sh
+              - python3 -m venv .venv
+              - source .venv/bin/activate
+              - ./scripts/install_deps.sh
+              - npx cdk ls && npx cdk synth && npx cdk bootstrap aws://$LIAFI_PROD_ACCOUNT/$AWS_DEFAULT_REGION
+              - npx cdk diff
+            artifacts:
+              - infra/cdk/frontend-deployment/cdk.out/**
+            # condition:
+            #   changesets:
+            #     includePaths:
+            #       - "infra/cdk/frontend-deployment/**"
+        - step:
+            name: Cloudfront stack plane
+            image: hashicorp/terraform 
+            oidc: true
+            script:
+              - export AWS_REGION=$AWS_DEFAULT_REGION
+              - export AWS_ROLE_ARN=$AWS_PROD_ROLE_ARN
+              - export AWS_WEB_IDENTITY_TOKEN_FILE=$(pwd)/web-identity-token
+              - echo $BITBUCKET_STEP_OIDC_TOKEN > $(pwd)/web-identity-token
+              - cd infra/terraform && terraform fmt  
+              - terraform init -input=false -backend-config="bucket=liafi-prod-tfstatefiles-bucket" && terraform validate
+              - terraform plan -var-file=vars/prod.tfvars -out=prod-tfplan
+            artifacts:
+              - infra/terraform/prod-tfplan
+        - step:
+            name: Build - Front-end
+            script:
+              - cd frontend
+              - npm ci
+              - npm run build
+            artifacts:
+              - frontend/build/**           
+        - step:
+            name: CDK - FE STAGING Deploy
+            oidc: true
+            deployment: Production
+            trigger: manual
+            script:
+              - export AWS_REGION=$AWS_DEFAULT_REGION
+              - export AWS_ROLE_ARN=$AWS_PROD_ROLE_ARN
+              - export AWS_WEB_IDENTITY_TOKEN_FILE=$(pwd)/web-identity-token
+              - echo $BITBUCKET_STEP_OIDC_TOKEN > $(pwd)/web-identity-token
+              - cd infra/cdk/frontend-deployment
+              - npx cdk deploy --app 'cdk.out/' --require-approval never
+        - step:
+            name: Cloudfront stack Deploy to Production
+            image: hashicorp/terraform
+            oidc: true
+            deployment: Production-TF
+            trigger: manual
+            script:
+              - export AWS_REGION=$AWS_DEFAULT_REGION
+              - export AWS_ROLE_ARN=$AWS_PROD_ROLE_ARN
+              - export AWS_WEB_IDENTITY_TOKEN_FILE=$(pwd)/web-identity-token
+              - echo $BITBUCKET_STEP_OIDC_TOKEN > $(pwd)/web-identity-token
+              - cd infra/terraform
+              - terraform init -input=false -backend-config="bucket=liafi-prod-tfstatefiles-bucket"
+              - terraform apply -auto-approve prod-tfplan                 
+    "**":
+        - step: 
+            <<: *cf_caches_invalidation
+        - step:
+            name: CDK - Build stacks DEV
+            oidc: true
+            script:
+              - export AWS_REGION=$AWS_DEFAULT_REGION
+              - export AWS_ROLE_ARN=$AWS_DEV_ROLE_ARN
+              - export AWS_WEB_IDENTITY_TOKEN_FILE=$(pwd)/web-identity-token
+              - echo $BITBUCKET_STEP_OIDC_TOKEN > $(pwd)/web-identity-token
+              - cd infra/cdk/frontend-deployment
+              - ./scripts/install_tools.sh
+              - python3 -m venv .venv
+              - source .venv/bin/activate
+              - ./scripts/install_deps.sh
+              - npx cdk ls && npx cdk synth
+              - npx cdk diff
+            artifacts:
+              - infra/cdk/frontend-deployment/cdk.out/**
+            #condition to just build if there is a change  
+            # condition:
+            #   changesets:
+            #     includePaths:
+            #       - "infra/cdk/frontend-deployment/**"
+        - step:
+            name: TF - Cloudfront stack plane
+            image: hashicorp/terraform 
+            oidc: true
+            script:
+              - export AWS_REGION=$AWS_DEFAULT_REGION
+              - export AWS_ROLE_ARN=$AWS_DEV_ROLE_ARN
+              - export AWS_WEB_IDENTITY_TOKEN_FILE=$(pwd)/web-identity-token
+              - echo $BITBUCKET_STEP_OIDC_TOKEN > $(pwd)/web-identity-token
+              - cd infra/terraform && terraform fmt  
+              - terraform init -input=false -backend-config="bucket=liafi-dev-tfstatefiles-bucket" && terraform validate
+              - terraform plan -var-file=vars/dev.tfvars -out=dev-tfplan
+            artifacts:
+              - infra/terraform/dev-tfplan
+        - step:
+            name: Build - Front-end
+            script:
+              - cd frontend
+              - npm ci
+              - npm run build
+            artifacts:
+              - frontend/build/**
